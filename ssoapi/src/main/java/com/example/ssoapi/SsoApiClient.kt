@@ -10,6 +10,7 @@ import android.os.Looper
 import android.os.RemoteException
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -41,6 +42,8 @@ class SsoApiClient(private val context: Context) {
         private const val SSO_SERVICE_ACTION = "com.example.service.SSO_SERVICE"
         private const val CONNECTION_TIMEOUT_MS = 5000L
         private const val CALLBACK_TIMEOUT_MS = 30000L
+        private const val MAX_CONNECTION_RETRIES = 3
+        private const val RETRY_DELAY_MS = 1000L
     }
 
     private var ssoService: sso? = null
@@ -67,14 +70,38 @@ class SsoApiClient(private val context: Context) {
     /**
      * Connect to the SSO Service on-demand.
      * This is a suspend function that waits for the connection to be established.
+     * Retries up to MAX_CONNECTION_RETRIES times with RETRY_DELAY_MS between each attempt.
      * @return true if connected successfully, false otherwise
      */
-    private suspend fun ensureConnected(): Boolean = withContext(Dispatchers.Main) {
+    private suspend fun ensureConnected(): Boolean {
         if (isBound && ssoService != null) {
             Log.d(TAG, "Already connected to service")
-            return@withContext true
+            return true
         }
 
+        repeat(MAX_CONNECTION_RETRIES) { attempt ->
+            Log.d(TAG, "Connection attempt ${attempt + 1} of $MAX_CONNECTION_RETRIES")
+            val connected = tryConnect()
+            if (connected) {
+                Log.d(TAG, "Connected on attempt ${attempt + 1}")
+                return true
+            }
+            if (attempt < MAX_CONNECTION_RETRIES - 1) {
+                Log.w(TAG, "Attempt ${attempt + 1} failed — retrying in ${RETRY_DELAY_MS}ms")
+                delay(RETRY_DELAY_MS)
+            }
+        }
+
+        Log.e(TAG, "All $MAX_CONNECTION_RETRIES connection attempts failed")
+        return false
+    }
+
+    /**
+     * Single connection attempt to the SSO Service.
+     * Must be called from a coroutine context.
+     * @return true if the service connected within CONNECTION_TIMEOUT_MS
+     */
+    private suspend fun tryConnect(): Boolean = withContext(Dispatchers.Main) {
         val intent = Intent(SSO_SERVICE_ACTION).apply {
             setPackage(SSO_SERVICE_PACKAGE)
             setClassName(SSO_SERVICE_PACKAGE, SSO_SERVICE_CLASS)
@@ -112,16 +139,10 @@ class SsoApiClient(private val context: Context) {
                 }
             }
 
-            if (connected == true) {
-                Log.d(TAG, "Successfully connected to SSO service")
-                return@withContext true
-            } else {
-                Log.w(TAG, "Connection timeout or failed")
-                return@withContext false
-            }
+            connected == true
         } catch (e: Exception) {
-            Log.e(TAG, "Error connecting to service", e)
-            return@withContext false
+            Log.e(TAG, "Error during connection attempt", e)
+            false
         }
     }
 
