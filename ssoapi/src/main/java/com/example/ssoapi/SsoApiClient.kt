@@ -9,8 +9,12 @@ import android.os.Handler
 import android.os.Looper
 import android.os.RemoteException
 import android.util.Log
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -50,6 +54,9 @@ class SsoApiClient(private val context: Context) {
     private var isBound = false
     private var pendingConnection: ((Boolean) -> Unit)? = null
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    /** Internal scope used by login() to connect-then-login when not yet bound. */
+    private val clientScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
@@ -159,6 +166,7 @@ class SsoApiClient(private val context: Context) {
             isBound = false
             ssoService = null
         }
+        clientScope.cancel()
     }
 
     /**
@@ -202,41 +210,82 @@ class SsoApiClient(private val context: Context) {
     }
 
     /**
-     * Login with email and password via AIDL service.
+     * Login with email and password.
+     *
+     * **Non-suspend — fire and forget from the caller's side.**
+     *
+     * - If already connected → calls the SSO service immediately
+     * - If **not** connected → lazily connects first, then calls the SSO service
+     *   In both cases [onResult] fires asynchronously on the main thread.
+     *
+     * Returns [SaResultData] immediately:
+     * - [SaResultData.success] == true  → request accepted (await [onResult])
+     * - [SaResultData.fail]    == true  → request rejected synchronously (bad params etc.)
      */
-    suspend fun login(mail: String, password: String): Result<Account> {
-        if (!ensureConnected()) {
-            return Result.failure(IllegalStateException("Could not connect to SSO Service. Please ensure the service is installed."))
+    fun login(
+        mail: String,
+        password: String,
+        onResult: (Result<Account>) -> Unit
+    ): SaResultData {
+        // ── Fast path: already connected ──────────────────────────────────────────
+        val service = ssoService
+        if (isBound && service != null) {
+            Log.d(TAG, "login(): already connected, calling service directly")
+            return doLogin(service, mail, password, onResult)
         }
 
-        return withContext(Dispatchers.IO) {
-            val service = ssoService
-            if (service == null) {
-                return@withContext Result.failure(IllegalStateException("Service not connected."))
+        // ── Lazy path: not connected yet — connect first, then login ───────────────
+        Log.d(TAG, "login(): not connected, connecting lazily before login")
+        clientScope.launch {
+            if (!ensureConnected()) {
+                Log.e(TAG, "login(): could not connect to SSO Service")
+                mainHandler.post {
+                    onResult(Result.failure(Exception("Could not connect to SSO Service")))
+                }
+                return@launch
             }
+            val connectedService = ssoService
+            if (connectedService == null) {
+                mainHandler.post {
+                    onResult(Result.failure(Exception("Service unavailable after connect")))
+                }
+                return@launch
+            }
+            doLogin(connectedService, mail, password, onResult)
+        }
 
-            try {
-                withTimeoutOrNull(CALLBACK_TIMEOUT_MS) {
-                    suspendCancellableCoroutine { continuation ->
-                        val callback = createCallback(
-                            onSuccess = { account ->
-                                if (continuation.isActive) continuation.resume(Result.success(account))
-                            },
-                            onFailure = { message ->
-                                if (continuation.isActive) continuation.resume(Result.failure(Exception(message)))
-                            }
-                        )
-                        try {
-                            service.login(mail, password, callback)
-                        } catch (e: RemoteException) {
-                            if (continuation.isActive) continuation.resume(Result.failure(e))
-                        }
-                    }
-                } ?: Result.failure(Exception("Login timeout"))
-            } catch (e: Exception) {
-                Log.e(TAG, "Login failed", e)
-                Result.failure(e)
+        // Return accepted: we are connecting and will call onResult when ready
+        return SaResultData(success = true, fail = false, message = "Connecting to SSO Service")
+    }
+
+    /** Executes the actual AIDL login call once a live [service] reference is in hand. */
+    private fun doLogin(
+        service: sso,
+        mail: String,
+        password: String,
+        onResult: (Result<Account>) -> Unit
+    ): SaResultData {
+        val callback = createCallback(
+            onSuccess = { account ->
+                Log.d(TAG, "login() onResult → success for ${account.mail}")
+                onResult(Result.success(account))
+            },
+            onFailure = { message ->
+                Log.w(TAG, "login() onResult → failure: $message")
+                onResult(Result.failure(Exception(message)))
             }
+        )
+        return try {
+            val immediate = service.login(mail, password, callback)
+            Log.d(TAG, "login() SaResultData: success=${immediate.success}, fail=${immediate.fail}, msg=${immediate.message}")
+            if (immediate.fail) {
+                onResult(Result.failure(Exception(immediate.message)))
+            }
+            immediate
+        } catch (e: RemoteException) {
+            Log.e(TAG, "login() RemoteException", e)
+            onResult(Result.failure(e))
+            SaResultData(success = false, fail = true, message = e.message ?: "RemoteException")
         }
     }
 
